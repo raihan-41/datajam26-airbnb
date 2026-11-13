@@ -1,0 +1,99 @@
+ =====================================================================
+# DataJam 2026 - Step 2 (Upgraded): Real 2026 Vancouver Property Tax CSV
+# Replaces hardcoded prices with live City of Vancouver Open Data CSV
+# =====================================================================
+
+library(tidyverse)
+library(scales)
+
+ia_caption <- "Data: Inside Airbnb, Vancouver, 15 June 2026, CC BY 4.0 | City of Vancouver Open Data (2026)"
+
+# 1. DOWNLOAD & LOAD OFFICIAL 2026 VANCOUVER PROPERTY TAX CSV
+van_csv_url <- paste0(
+  "https://opendata.vancouver.ca/api/explore/v2.1/catalog/datasets/property-tax-report/exports/csv?",
+  "where=report_year%3D%272026%27&limit=50000&delimiter=%2C"
+)
+
+if (!file.exists("vancouver_2026_property_tax_raw.csv")) {
+  cat("Downloading official 2026 Property Tax CSV from City of Vancouver Open Data...\n")
+  download.file(van_csv_url, destfile = "vancouver_2026_property_tax_raw.csv", mode = "wb")
+}
+
+tax_raw_df <- read_csv("vancouver_2026_property_tax_raw.csv", show_col_types = FALSE)
+
+# 2. MAP POSTAL CODE PREFIXES (FSAs) TO INSIDE AIRBNB NEIGHBOURHOODS
+fsa_to_neighbourhood <- tibble(
+  fsa = c(
+    "V6B", "V6C", "V6Z", "V6E", "V6G", "V6J", "V6K", "V6R", "V6S", "V6N",
+    "V6M", "V6L", "V6H", "V5Z", "V6P", "V5T", "V5Y", "V5L", "V5N", "V5K",
+    "V5M", "V5R", "V5V", "V5W", "V5X", "V5P", "V5S", "V6A", "V6M", "V5Z", "V5Z"
+  ),
+  neighbourhood_cleansed = c(
+    "Downtown", "Downtown", "Downtown", "West End", "West End", "Kitsilano", "Kitsilano",
+    "West Point Grey", "Dunbar-Southlands", "Dunbar-Southlands", "Kerrisdale", "Arbutus Ridge",
+    "Fairview", "Fairview", "Marpole", "Mount Pleasant", "Mount Pleasant", "Grandview-Woodland",
+    "Kensington-Cedar Cottage", "Hastings-Sunrise", "Renfrew-Collingwood", "Renfrew-Collingwood",
+    "Riley Park", "Sunset", "Sunset", "Victoria-Fraserview", "Killarney", "Strathcona",
+    "Shaughnessy", "South Cambie", "Oakridge"
+  )
+)
+
+# 3. COMPUTE REAL 2026 ASSESSED VALUES & TAX LEVIES BY BEDROOM GROUP
+real_van_prices <- tax_raw_df %>%
+  mutate(
+    assessed_value = current_land_value + current_improvement_value,
+    fsa = str_sub(str_trim(property_postal_code), 1, 3)
+  ) %>%
+  filter(
+    legal_type %in% c("STRATA", "LAND"),
+    !is.na(assessed_value),
+    assessed_value >= 300000,
+    assessed_value <= 6000000
+  ) %>%
+  inner_join(fsa_to_neighbourhood, by = "fsa", relationship = "many-to-many") %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(
+    # Map 35th & 75th percentile STRATA assessments to Studio/1BR & 2BR, and LAND to 3+BR
+    `Studio/1BR` = quantile(assessed_value[legal_type == "STRATA"], 0.35, na.rm = TRUE),
+    `2BR`        = quantile(assessed_value[legal_type == "STRATA"], 0.75, na.rm = TRUE),
+    `3+BR`       = coalesce(
+      median(assessed_value[legal_type == "LAND"], na.rm = TRUE),
+      quantile(assessed_value[legal_type == "STRATA"], 0.90, na.rm = TRUE)
+    ),
+    median_tax_levy = median(tax_levy, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c("Studio/1BR", "2BR", "3+BR"),
+    names_to = "bedroom_group",
+    values_to = "purchase_price"
+  ) %>%
+  mutate(
+    # Annual Operating Expenses = Real Property Tax + Strata/Maint (1.2%) + $1,060 City STR Licence
+    annual_expenses = coalesce(median_tax_levy, purchase_price * 0.003) + (purchase_price * 0.012) + 1060
+  )
+
+write_csv(real_van_prices, "outputs/vancouver_2026_prices_from_csv.csv")
+
+# 4. JOIN WITH YOUR CLEANED AIRBNB REVENUE TABLE & SIMULATE $10M PORTFOLIO
+by_neigh_bed <- read_csv("outputs/revenue_by_neighbourhood_bedroom.csv", show_col_types = FALSE)
+
+portfolio_analysis <- by_neigh_bed %>%
+  inner_join(real_van_prices, by = c("neighbourhood_cleansed", "bedroom_group")) %>%
+  mutate(
+    unit_noi_p25       = p25_revenue - annual_expenses,
+    unit_noi_med       = median_revenue - annual_expenses,
+    unit_noi_p75       = p75_revenue - annual_expenses,
+    net_yield_pct      = (unit_noi_med / purchase_price) * 100,
+    units_to_buy       = floor(10000000 / purchase_price),
+    capital_deployed   = units_to_buy * purchase_price,
+    portfolio_noi_low  = units_to_buy * unit_noi_p25,
+    portfolio_noi_base = units_to_buy * unit_noi_med,
+    portfolio_noi_high = units_to_buy * unit_noi_p75,
+    single_unit_risk   = round((1 / units_to_buy) * 100, 1)
+  ) %>%
+  filter(units_to_buy >= 1) %>%
+  arrange(desc(portfolio_noi_base))
+
+write_csv(portfolio_analysis, "outputs/ddd_10m_portfolio_real_csv.csv")
+print(head(portfolio_analysis, 10))
